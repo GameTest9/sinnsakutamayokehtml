@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>極限・弾幕回避ゲーム - 真・完全カオス版</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: 'Courier New', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; touch-action: none; }
+        canvas { background: #000; border: 4px solid #fff; box-shadow: 0 0 20px rgba(255,255,255,0.2); display: block; }
+        #info { position: absolute; text-align: center; font-size: 22px; font-weight: bold; text-shadow: 0 0 10px #000; color: #fff; cursor: pointer; }
+        #upgradeScreen { display: none; position: absolute; text-align: center; background: rgba(0,0,0,0.95); border: 4px solid #fff; padding: 20px; border-radius: 0px; width: 300px; }
+        .upgrade-btn { display: block; width: 100%; margin: 12px 0; padding: 12px; background: #000; color: #fff; border: 2px solid #fff; font-size: 16px; font-weight: bold; cursor: pointer; font-family: 'Courier New', sans-serif; transition: 0.1s; }
+        .upgrade-btn:hover { background: #fff; color: #000; }
+        #upgradeTitle { font-size: 20px; margin-bottom: 15px; color: #fff; }
+    </style>
+</head>
+<body>
+    <div id="info">画面クリックでスタート<br>【↑→↓←/WASD】で移動<br>【スペースキー】でボム(弾消し)</div>
+    
+    <!-- パワーアップ選択画面 -->
+    <div id="upgradeScreen">
+        <div id="upgradeTitle">WAVE CLEAR!<br>▼ 強化を選んでください</div>
+        <button class="upgrade-btn" onclick="selectUpgrade('speed')">❤ 移動速度アップ (+1)</button>
+        <button class="upgrade-btn" onclick="selectUpgrade('size')">❤ 当たり判定を小さく (-1px)</button>
+        <button class="upgrade-btn" onclick="selectUpgrade('heal')">❤ HPを1回復する</button>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+    <script>
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+        const info = document.getElementById("info");
+        const upgradeScreen = document.getElementById("upgradeScreen");
+
+        canvas.width = Math.min(window.innerWidth, 480);
+        canvas.height = Math.min(window.innerHeight, 640);
+
+        // --- オーディオエンジン（Web Audio API）の設定 ---
+        let audioCtx = null;
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        // ピコピコ効果音を生成して鳴らす共通関数
+        function playSound(type) {
+            if (!audioCtx) return;
+            
+            let osc = audioCtx.createOscillator();
+            let gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            let now = audioCtx.currentTime;
+
+            if (type === "hit") { // 被弾時のダメージ音
+                osc.type = "sawtooth";
+                osc.frequency.setValueAtTime(150, now);
+                osc.frequency.exponentialRampToValueAtTime(40, now + 0.3);
+                gain.gain.setValueAtTime(0.3, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.3);
+                osc.start(now); osc.stop(now + 0.3);
+            } 
+            else if (type === "bomb") { // ボム発動時の爆発音
+                osc.type = "triangle";
+                osc.frequency.setValueAtTime(100, now);
+                osc.frequency.linearRampToValueAtTime(10, now + 0.4);
+                gain.gain.setValueAtTime(0.4, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.4);
+                osc.start(now); osc.stop(now + 0.4);
+            } 
+            else if (type === "laser") { // ブラスター発射時のビーム音
+                osc.type = "sawtooth";
+                osc.frequency.setValueAtTime(800, now);
+                osc.frequency.exponentialRampToValueAtTime(200, now + 0.25);
+                gain.gain.setValueAtTime(0.15, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.25);
+                osc.start(now); osc.stop(now + 0.25);
+            } 
+            else if (type === "bone") { // 骨が出現するときの音
+                osc.type = "square";
+                osc.frequency.setValueAtTime(220, now);
+                osc.frequency.setValueAtTime(293, now + 0.05);
+                gain.gain.setValueAtTime(0.1, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.15);
+                osc.start(now); osc.stop(now + 0.15);
+            }
+            else if (type === "clear") { // WAVEクリア時のファンファーレ
+                osc.type = "square";
+                osc.frequency.setValueAtTime(523, now); // ド
+                osc.frequency.setValueAtTime(659, now + 0.1); // ミ
+                osc.frequency.setValueAtTime(784, now + 0.2); // ソ
+                osc.frequency.setValueAtTime(1046, now + 0.3); // 高いド
+                gain.gain.setValueAtTime(0.2, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.5);
+                osc.start(now); osc.stop(now + 0.5);
+            }
+        }
+        // --- BGM演奏用のシーケンサー設定 ---
+        let bgmIntervalId = null;
+        let bgmStep = 0;
+
+        // ノーツ（音名）と周波数の対応表
+        const NOTES = { A3: 220.00, B3: 246.94, C4: 261.63, D4: 293.66, E4: 329.63, F4: 349.23, G4: 392.00, A4: 440.00 };
+
+        // WAVE 1～8の通常戦闘曲（16ステップ）
+        const BGM_NORMAL = [
+            "A3", "A3", "E4", "A3", "G4", "A3", "E4", "D4",
+            "C4", "C4", "G4", "C4", "F4", "C4", "E4", "D4"
+        ];
+
+        // WAVE 9～14専用の最終ボス決戦曲（より激しいベースライン）
+        const BGM_BOSS = [
+            "D4", "D4", "A4", "D4", "G4", "D4", "F4", "E4",
+            "C4", "C4", "G4", "C4", "F4", "C4", "E4", "C4"
+        ];
+
+        function playBgmStep() {
+            if (!audioCtx || !isPlaying || isUpgrading) return;
+
+            let scoreTrack = (wave >= 9) ? BGM_BOSS : BGM_NORMAL;
+            let noteName = scoreTrack[bgmStep % scoreTrack.length];
+            let freq = NOTES[noteName];
+
+            let osc = audioCtx.createOscillator();
+            let gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            let now = audioCtx.currentTime;
+            
+            osc.type = (wave >= 9) ? "sawtooth" : "triangle";
+            osc.frequency.setValueAtTime(freq, now);
+
+            gain.gain.setValueAtTime(0.06, now);
+            gain.gain.linearRampToValueAtTime(0, now + 0.12);
+
+            osc.start(now);
+            osc.stop(now + 0.13);
+
+            bgmStep++;
+        }
+
+        function startBgm() {
+            stopBgm();
+            bgmStep = 0;
+            let speed = (wave >= 9) ? 120 : 160; // ボス戦は高速化
+            bgmIntervalId = setInterval(playBgmStep, speed);
+        }
+
+        function stopBgm() {
+            if (bgmIntervalId) {
+                clearInterval(bgmIntervalId);
+                bgmIntervalId = null;
+            }
+        }
+        // --- ゲーム状態設定（基本パラメータの管理） ---
+        let player = { x: canvas.width / 2, y: canvas.height - 100, size: 6, speed: 4.5, hp: 3, maxHp: 3, invincibleTimer: 0 };
+        let bullets = [];
+        let blasters = [];
+        let bones = [];          
+        let rotateBlaster = null; 
+
+        let score = 0;
+        let isPlaying = false;
+        let isUpgrading = false;
+        let frameCount = 0;
+        
+        let wave = 1;
+        let waveTimer = 1800; // 30秒
+        
+        let bombCount = 2; 
+        let bombEffect = { active: false, x: 0, y: 0, radius: 0, maxRadius: 120 };
+
+        // キーボードの入力状態の辞書
+        let keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, w: false, a: false, s: false, d: false, " ": false };
+
+        window.addEventListener("keydown", (e) => {
+            if (e.key in keys) {
+                keys[e.key] = true;
+                if(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+            }
+        });
+        window.addEventListener("keyup", (e) => { 
+            if (e.key in keys) keys[e.key] = false; 
+        });
+
+        // 画面クリックでゲーム開始
+        info.addEventListener("click", () => {
+            if (!isPlaying && !isUpgrading) {
+                initAudio();
+                if (audioCtx && audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+
+                isPlaying = true;
+                score = 0;
+                wave = 1;
+                waveTimer = 1800;
+                frameCount = 0;
+                bombCount = 2;
+                bullets = [];
+                blasters = [];
+                bones = [];
+                rotateBlaster = null;
+                bombEffect.active = false;
+                player = { x: canvas.width / 2, y: canvas.height - 100, size: 6, speed: 4.5, hp: 3, maxHp: 3, invincibleTimer: 0 };
+                for (let key in keys) keys[key] = false;
+                info.style.display = "none";
+                
+                startBgm();
+                gameLoop();
+            }
+        });
+        function addBullet(x, y, vx, vy, size, color, isHoming = false) {
+            bullets.push({ x, y, vx, vy, size, color, isHoming, hasFinishedHoming: false });
+        }
+
+        // 通常ブラスター（上から縦）
+        function triggerBlaster(customTimer = 45) {
+            let targetX = Math.random() * (canvas.width - 60) + 30;
+            blasters.push({ x: targetX, y: 0, dir: "v", timer: customTimer, width: 40, laserActive: false, laserDuration: 20 });
+        }
+
+        // WAVE 11用：位置・方向指定型ブラスター（h: 横レーザー、v: 縦レーザー）
+        function triggerCustomBlaster(pos, dir, customTimer = 45) {
+            blasters.push({ x: (dir === "v" ? pos : 0), y: (dir === "h" ? pos : 0), dir: dir, timer: customTimer, width: 35, laserActive: false, laserDuration: 18 });
+        }
+
+        function addBone(x, y, vx, vy, width, height, type) {
+            bones.push({ x, y, vx, vy, width, height, type, timer: 0 });
+        }
+
+        // WAVE 5：下からのトゲ骨（ボーンウォール）
+        function triggerBoneWall() {
+            playSound("bone");
+            for (let x = 0; x < canvas.width; x += 30) {
+                addBone(x, canvas.height, 0, -2, 20, 80, "wall");
+            }
+        }
+
+        // WAVE 8：左右の壁から突き出す骨
+        function triggerSideBones() {
+            playSound("bone");
+            let targetY = Math.random() * (canvas.height - 250) + 100;
+            addBone(-50, targetY, 5, 0, 100, 30, "side");
+            addBone(canvas.width + 50, targetY + 45, -5, 0, 100, 30, "side");
+        }
+
+        // WAVE 12：自機位置に直接湧き出る罠骨（ファントムボーン）
+        function triggerPhantomBone() {
+            playSound("bone");
+            // 自機の今の足元（少し下）を中心に、透明な予兆のあとに出現させるためタイプを指定
+            addBone(player.x, player.y, 0, 0, 25, 120, "phantom");
+        }
+        function activateBomb() {
+            if (bombCount > 0 && !bombEffect.active) {
+                bombCount--;
+                bombEffect.active = true;
+                bombEffect.x = player.x;
+                bombEffect.y = player.y;
+                bombEffect.radius = 0;
+                playSound("bomb");
+            }
+        }
+
+        function updateBombEffect() {
+            if (!bombEffect.active) return;
+            bombEffect.radius += 6;
+
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i];
+                let dx = b.x - bombEffect.x;
+                let dy = b.y - bombEffect.y;
+                let dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist <= bombEffect.radius) {
+                    bullets.splice(i, 1);
+                }
+            }
+            if (bombEffect.radius >= bombEffect.maxRadius) {
+                bombEffect.active = false;
+            }
+        }
+
+        // 全14WAVEの超カオス攻撃生成システム（前半：WAVE 1～6）
+        function spawnAttack() {
+            frameCount++;
+
+            // WAVE 1：小雨
+            let rainInterval = (wave === 1) ? 5 : 9;
+            if (frameCount % rainInterval === 0) {
+                addBullet(Math.random() * canvas.width, -10, (Math.random() - 0.5) * 1.5, Math.random() * 2 + 2, 5, "#ff3333");
+            }
+
+            // WAVE 2：青い追尾誘導弾
+            if (wave >= 2) {
+                let homingInterval = (wave === 2) ? 60 : 110;
+                if (frameCount % homingInterval === 0) {
+                    addBullet(Math.random() * canvas.width, -10, 0, 1.5, 7, "#3399ff", true);
+                }
+            }
+
+            // WAVE 3：横からの交差弾
+            if (wave >= 3) {
+                let crossInterval = (wave === 3) ? 35 : 65;
+                if (frameCount % crossInterval === 0) {
+                    addBullet(0, Math.random() * canvas.height, Math.random() * 2 + 2, 0, 6, "#ffff33");
+                    addBullet(canvas.width, Math.random() * canvas.height, -(Math.random() * 2 + 2), 0, 6, "#ffff33");
+                }
+            }
+
+            // WAVE 4：ガスターブラスター
+            if (wave >= 4) {
+                let blasterInterval = (wave === 4) ? 100 : 150;
+                if (frameCount % blasterInterval === 0) {
+                    let blasterTimer = (wave === 4) ? 45 : 80;
+                    triggerBlaster(blasterTimer);
+                }
+            }
+
+            // WAVE 5：骨の罠ボーンウォール
+            if (wave >= 5) {
+                let wallInterval = (wave === 5) ? 140 : 240;
+                if (frameCount % wallInterval === 0) {
+                    triggerBoneWall();
+                }
+            }
+
+            // WAVE 6：回転ブラスター（中央の十字レーザー）
+            if (wave >= 6) {
+                if (rotateBlaster === null && frameCount % 220 === 0) {
+                    playSound("bone");
+                    rotateBlaster = {
+                        x: canvas.width / 2,
+                        y: canvas.height / 2.5,
+                        angle: 0,
+                        speed: (wave === 6) ? 0.02 : 0.008, // 次のWAVEで大幅減速
+                        activeTimer: 300,
+                        shootBarrage: false // WAVE13用フラグ
+                    };
+                }
+            }
+            // WAVE 7：追尾する巨骨ソウルチェイサー
+            if (wave >= 7) {
+                let giantInterval = (wave === 7) ? 120 : 220;
+                if (frameCount % giantInterval === 0) {
+                    playSound("bone");
+                    addBone(Math.random() * canvas.width, -40, 0, 1.2, 40, 40, "giant");
+                }
+            }
+
+            // WAVE 8：叩きつけ骨プラネットボーン
+            if (wave >= 8) {
+                let sideInterval = (wave === 8) ? 90 : 160;
+                if (frameCount % sideInterval === 0) {
+                    triggerSideBones();
+                }
+            }
+
+            // WAVE 9：全方位バースト（WAVE14カオスへの布石）
+            if (wave >= 9) {
+                let burstInterval = (wave === 9) ? 45 : 70;
+                if (frameCount % burstInterval === 0) {
+                    const cx = canvas.width / 2;
+                    const cy = canvas.height / 3;
+                    for (let i = 0; i < 10; i++) {
+                        let angle = (Math.PI * 2 / 10) * i + (frameCount * 0.1);
+                        addBullet(cx, cy, Math.cos(angle) * 2.2, Math.sin(angle) * 2.2, 6, "#ff00ff");
+                    }
+                }
+            }
+
+            // 【新攻擊】WAVE 10：骨の雨スカイボーン
+            if (wave >= 10) {
+                let skyBoneInterval = (wave === 10) ? 40 : 80;
+                if (frameCount % skyBoneInterval === 0) {
+                    playSound("bone");
+                    // 上から不規則に巨大な骨が降ってくる
+                    addBone(Math.random() * canvas.width, -50, (Math.random() - 0.5) * 1, 2.5, 30, 90, "sky");
+                }
+            }
+
+            // 【新攻擊】WAVE 11：時間差ブラスター（格子状レーザー）
+            if (wave >= 11) {
+                let gridInterval = (wave === 11) ? 140 : 240;
+                if (frameCount % gridInterval === 0) {
+                    // 縦2本、横3本のラインに格子状のブラスターを時間差で配置
+                    triggerCustomBlaster(canvas.width * 0.33, "v", 50);
+                    triggerCustomBlaster(canvas.width * 0.66, "v", 50);
+                    triggerCustomBlaster(canvas.height * 0.25, "h", 70);
+                    triggerCustomBlaster(canvas.height * 0.5, "h", 70);
+                    triggerCustomBlaster(canvas.height * 0.75, "h", 70);
+                }
+            }
+            // 【新攻撃】WAVE 12：神出鬼没の骨（ファントムボーン）
+            if (wave >= 12) {
+                let phantomInterval = (wave === 12) ? 80 : 160;
+                if (frameCount % phantomInterval === 0) {
+                    triggerPhantomBone();
+                }
+            }
+
+            // 【新攻撃】WAVE 13：回転バラージ（デス・スパイラル）
+            if (wave >= 13) {
+                if (rotateBlaster !== null) {
+                    rotateBlaster.shootBarrage = true; // 回転中に弾を撃つフラグをオン
+                }
+            }
+
+            // 【新攻撃】WAVE 14：真の絶望（ジ・エンド）
+            if (wave >= 14) {
+                // 最終WAVE：画面中央から超高速で弾が乱射される
+                if (frameCount % 12 === 0) {
+                    const cx = canvas.width / 2;
+                    const cy = canvas.height / 2.5;
+                    for (let i = 0; i < 4; i++) {
+                        let angle = (Math.PI * 2 / 4) * i - (frameCount * 0.15);
+                        addBullet(cx, cy, Math.cos(angle) * 3.5, Math.sin(angle) * 3.5, 6, "#ffffff");
+                    }
+                }
+            }
+        }
+
+        function updatePlayerPosition() {
+            if (keys.ArrowUp || keys.w) player.y -= player.speed;
+            if (keys.ArrowDown || keys.s) player.y += player.speed;
+            if (keys.ArrowLeft || keys.a) player.x -= player.speed;
+            if (keys.ArrowRight || keys.d) player.x += player.speed;
+
+            if (keys[" "]) {
+                activateBomb();
+            }
+
+            if (player.x < player.size) player.x = player.size;
+            if (player.x > canvas.width - player.size) player.x = canvas.width - player.size;
+            if (player.y < player.size) player.y = player.size;
+            if (player.y > canvas.height - player.size) player.y = canvas.height - player.size;
+        }
+
+        function takeDamage() {
+            if (player.invincibleTimer > 0) return;
+
+            player.hp--;
+            playSound("hit"); // 被弾時のダメージ音
+            
+            if (player.hp <= 0) {
+                isPlaying = false;
+                stopBgm(); // 音楽停止
+                info.innerHTML = `GAME OVER<br><span style="font-size:16px;">WAVE ${wave} で力尽きた</span><br><br>クリックで再挑戦`;
+                info.style.display = "block";
+            } else {
+                player.invincibleTimer = 60; // 1秒無敵
+            }
+        }
+        function selectUpgrade(type) {
+            if (type === 'speed') player.speed += 1.0;
+            if (type === 'size') player.size = Math.max(3, player.size - 1);
+            if (type === 'heal') player.hp = Math.min(player.maxHp, player.hp + 1);
+
+            upgradeScreen.style.display = "none";
+            isUpgrading = false;
+            isPlaying = true;
+            
+            wave++;
+            waveTimer = 1800;
+            bombCount = 2; // ボム全回復
+            bullets = [];
+            blasters = [];
+            bones = [];
+            rotateBlaster = null;
+            bombEffect.active = false;
+            frameCount = 0;
+            
+            startBgm();
+            gameLoop();
+        }
+
+        function gameLoop() {
+            if (!isPlaying || isUpgrading) return;
+
+            ctx.fillStyle = "rgba(0, 0, 0, 0.4)";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            score++;
+            waveTimer--;
+            updatePlayerPosition();
+            updateBombEffect(); 
+            spawnAttack();
+
+            if (player.invincibleTimer > 0) {
+                player.invincibleTimer--;
+            }
+
+            // WAVEクリア（音楽停止＆ファンファーレ）
+            if (waveTimer <= 0) {
+                isPlaying = false;
+                isUpgrading = true;
+                stopBgm();          
+                playSound("clear"); 
+                upgradeScreen.style.display = "block";
+                return;
+            }
+
+            // --- 1. ブラスター群（縦・横対応）の更新と描画（発射音付き） ---
+            for (let i = blasters.length - 1; i >= 0; i--) {
+                let b = blasters[i];
+                b.timer--;
+
+                if (b.timer > 0) {
+                    // 予兆線の描画（方向 dir によって縦横を切り替え）
+                    ctx.strokeStyle = "rgba(255, 0, 0, 0.7)";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    if (b.dir === "v") {
+                        ctx.moveTo(b.x, 0); ctx.lineTo(b.x, canvas.height);
+                    } else {
+                        ctx.moveTo(0, b.y); ctx.lineTo(canvas.width, b.y);
+                    }
+                    ctx.stroke();
+
+                    // ブラスターの「目」のような予兆
+                    ctx.fillStyle = "#fff";
+                    ctx.beginPath();
+                    if (b.dir === "v") ctx.arc(b.x, 20, 12, 0, Math.PI * 2);
+                    else ctx.arc(20, b.y, 12, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    if (!b.laserActive) {
+                        playSound("laser"); // 発射時のSE
+                    }
+                    b.laserActive = true; b.laserDuration--;
+
+                    // レーザーの描画（縦横切り替え）
+                    ctx.fillStyle = "#ffffff";
+                    if (b.dir === "v") ctx.fillRect(b.x - b.width / 2, 0, b.width, canvas.height);
+                    else ctx.fillRect(0, b.y - b.width / 2, canvas.width, b.width);
+
+                    ctx.fillStyle = "#33aaff";
+                    if (b.dir === "v") ctx.fillRect(b.x - b.width / 4, 0, b.width / 2, canvas.height);
+                    else ctx.fillRect(0, b.y - b.width / 4, canvas.width, b.width / 2);
+
+                    // 当たり判定
+                    if (b.dir === "v") {
+                        if (player.x + player.size > b.x - b.width / 2 && player.x - player.size < b.x + b.width / 2) takeDamage();
+                    } else {
+                        if (player.y + player.size > b.y - b.width / 2 && player.y - player.size < b.y + b.width / 2) takeDamage();
+                    }
+
+                    if (b.laserDuration <= 0) blasters.splice(i, 1);
+                }
+            }
+            // --- 2. 回転ブラスター（十字レーザー ＆ WAVE13弾幕） ---
+            if (rotateBlaster !== null) {
+                let rb = rotateBlaster;
+                rb.activeTimer--;
+                rb.angle += rb.speed;
+
+                if (rb.activeTimer % 30 === 0) {
+                    playSound("laser");
+                }
+
+                // 【WAVE 13：デス・スパイラル弾幕】
+                if (rb.shootBarrage && rb.activeTimer % 6 === 0) {
+                    // 回転ビームの先端方向や逆方向に向けて、螺旋状に弾を撃ち出す
+                    let bulletSpeed = 2.5;
+                    addBullet(rb.x, rb.y, Math.cos(rb.angle) * bulletSpeed, Math.sin(rb.angle) * bulletSpeed, 6, "#ff33aa");
+                    addBullet(rb.x, rb.y, Math.cos(rb.angle + Math.PI) * bulletSpeed, Math.sin(rb.angle + Math.PI) * bulletSpeed, 6, "#ff33aa");
+                }
+
+                ctx.save();
+                ctx.translate(rb.x, rb.y);
+                ctx.rotate(rb.angle);
+
+                ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+                ctx.fillRect(-12, -canvas.height, 24, canvas.height * 2);
+                ctx.fillRect(-canvas.width, -12, canvas.width * 2, 24);
+                ctx.fillStyle = "rgba(51, 170, 255, 0.9)";
+                ctx.fillRect(-6, -canvas.height, 12, canvas.height * 2);
+                ctx.fillRect(-canvas.width, -6, canvas.width * 2, 12);
+
+                ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(0, 0, 20, 0, Math.PI * 2); ctx.fill();
+                ctx.fillStyle = "#ff3333"; ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+
+                let rdx = player.x - rb.x;
+                let rdy = player.y - rb.y;
+                let distToCenter = Math.sqrt(rdx * rdx + rdy * rdy);
+                let relativeAngle = Math.atan2(rdy, rdx) - rb.angle;
+                relativeAngle = Math.atan2(Math.sin(relativeAngle), Math.cos(relativeAngle));
+
+                if (Math.abs(Math.sin(relativeAngle * 2)) < 14 / distToCenter) {
+                    takeDamage();
+                }
+
+                if (rb.activeTimer <= 0) rotateBlaster = null;
+            }
+            // --- 3. 各種「骨（ボーン）」オブジェクト（全5種）の更新と描画 ---
+            for (let i = bones.length - 1; i >= 0; i--) {
+                let bo = bones[i];
+                bo.timer++;
+
+                // 骨のタイプ別の動き
+                if (bo.type === "wall") {
+                    if (bo.timer < 30) bo.y += bo.vy;
+                    else if (bo.timer > 110) bo.y -= bo.vy;
+                } else if (bo.type === "giant") {
+                    let gdx = player.x - bo.x;
+                    let gdy = player.y - bo.y;
+                    let gdist = Math.sqrt(gdx * gdx + gdy * gdy);
+                    if (gdist > 0) bo.x += (gdx / gdist) * 1.0;
+                    bo.y += bo.vy;
+                } else if (bo.type === "side") {
+                    if (bo.timer < 20) bo.x += bo.vx;
+                    else if (bo.timer > 70) bo.x -= bo.vx;
+                } else if (bo.type === "sky") {
+                    // 【新攻撃】骨の雨：まっすぐ下に降ってくる
+                    bo.y += bo.vy;
+                    bo.x += bo.vx;
+                } else if (bo.type === "phantom") {
+                    // 【新攻撃】ファントムボーン：最初の30フレは予兆（動かない）
+                    if (bo.timer === 30) {
+                        playSound("bone"); // 出現時に音を鳴らす
+                    }
+                }
+
+                // 骨の描画
+                if (bo.type === "phantom" && bo.timer < 30) {
+                    // ファントムボーンの予兆（赤い枠線だけで警告）
+                    ctx.strokeStyle = "rgba(255, 0, 0, 0.6)";
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(bo.x - bo.width / 2, bo.y - bo.height / 2, bo.width, bo.height);
+                } else {
+                    // 通常の骨の描画
+                    ctx.fillStyle = "#ffffff";
+                    if (bo.type === "phantom") {
+                        // ファントムは中心座標基準で描画
+                        ctx.fillRect(bo.x - bo.width / 2, bo.y - bo.height / 2, bo.width, bo.height);
+                    } else {
+                        ctx.fillRect(bo.x - bo.width / 2, bo.y, bo.width, bo.height);
+                    }
+
+                    // 当たり判定（予兆中以外のみ判定する）
+                    let hit = false;
+                    if (bo.type === "phantom") {
+                        if (player.x + player.size > bo.x - bo.width / 2 && player.x - player.size < bo.x + bo.width / 2 &&
+                            player.y + player.size > bo.y - bo.height / 2 && player.y - player.size < bo.y + bo.height / 2) {
+                            hit = true;
+                        }
+                    } else {
+                        if (player.x + player.size > bo.x - bo.width / 2 && player.x - player.size < bo.x + bo.width / 2 &&
+                            player.y + player.size > bo.y && player.y - player.size < bo.y + bo.height) {
+                            hit = true;
+                        }
+                    }
+                    if (hit) takeDamage();
+                }
+
+                // 画面外、または時間が経ったら削除
+                if ((bo.type === "giant" || bo.type === "sky") && bo.y > canvas.height + 100) {
+                    bones.splice(i, 1);
+                } else if ((bo.type === "wall" || bo.type === "side") && bo.timer > 140) {
+                    bones.splice(i, 1);
+                } else if (bo.type === "phantom" && bo.timer > 80) {
+                    bones.splice(i, 1); // 湧き出てから少し経ったら消える
+                }
+            }
+            // --- 4. ボム（弾消し衝撃波）の視覚エフェクト描画 ---
+            if (bombEffect.active) {
+                ctx.strokeStyle = "rgba(255, 255, 255, " + (1 - bombEffect.radius / bombEffect.maxRadius) + ")";
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.arc(bombEffect.x, bombEffect.y, bombEffect.radius, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+
+            // --- 5. 自機（プレイヤー）の描画 ---
+            if (player.invincibleTimer === 0 || Math.floor(player.invincibleTimer / 4) % 2 === 0) {
+                ctx.fillStyle = "#fff";
+                ctx.beginPath();
+                ctx.arc(player.x, player.y, player.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // --- 6. 通常弾・誘導弾の更新と描画 ---
+            for (let i = bullets.length - 1; i >= 0; i--) {
+                let b = bullets[i];
+
+                if (b.isHoming) {
+                    if (!b.hasFinishedHoming && b.y >= player.y) {
+                        b.hasFinishedHoming = true;
+                        b.vx = 0;
+                        b.vy = 2.5; 
+                    }
+
+                    if (!b.hasFinishedHoming) {
+                        let dx = player.x - b.x;
+                        let dy = player.y - b.y;
+                        let dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist > 0) {
+                            let targetVx = (dx / dist) * 1.8;
+                            let targetVy = (dy / dist) * 1.8;
+                            b.vx = b.vx * 0.95 + targetVx * 0.05;
+                            b.vy = b.vy * 0.95 + targetVy * 0.05;
+                        }
+                    }
+                }
+
+                b.x += b.vx;
+                b.y += b.vy;
+
+                ctx.fillStyle = b.color;
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, b.size, 0, Math.PI * 2);
+                ctx.fill();
+
+                let dx = b.x - player.x;
+                let dy = b.y - player.y;
+                let dist = Math.sqrt(dx * dx + dy * dy);
+                
+                if (dist < b.size + player.size - 1) {
+                    takeDamage();
+                    if (player.invincibleTimer > 0) {
+                        bullets.splice(i, 1); 
+                    }
+                } else if (b.y > canvas.height + 30 || b.y < -30 || b.x < -30 || b.x > canvas.width + 30) {
+                    bullets.splice(i, 1);
+                }
+            }
+
+            // --- 7. UI表示（全14WAVEの称号システム） ---
+            ctx.fillStyle = "#fff";
+            ctx.font = "16px 'Courier New', sans-serif";
+            
+            let waveTitle = `WAVE: ${wave}`;
+            if (wave === 5) waveTitle += " [BONE WALL]";
+            if (wave === 6) waveTitle += " [CROSS LASER]";
+            if (wave === 7) waveTitle += " [GIANT CHASER]";
+            if (wave === 8) waveTitle += " [PLANET BONE]";
+            if (wave === 9) waveTitle += " [BURST END]";
+            if (wave === 10) waveTitle += " [SKY BONE]";
+            if (wave === 11) waveTitle += " [GRID LASER]";
+            if (wave === 12) waveTitle += " [PHANTOM BONE]";
+            if (wave === 13) waveTitle += " [DEATH SPIRAL]";
+            if (wave >= 14) waveTitle += " [THE END]";
+            ctx.fillText(waveTitle, 15, 30);
+
+            // WAVE残り時間タイムバー
+            ctx.fillStyle = "#333";
+            ctx.fillRect(15, 45, 120, 6);
+            ctx.fillStyle = "#fff";
+            ctx.fillRect(15, 45, (waveTimer / 1800) * 120, 6);
+
+            // HP表示
+            let hpHearts = "";
+            for(let h = 0; h < player.hp; h++) {
+                hpHearts += "❤";
+            }
+            ctx.fillStyle = "#ff3333";
+            ctx.font = "16px 'Courier New', sans-serif";
+            ctx.fillText(`HP: ${hpHearts}`, 15, 75);
+
+            // ボム残り回数表示
+            let bombIcons = "";
+            for(let b = 0; b < bombCount; b++) {
+                bombIcons += "💣";
+            }
+            ctx.fillStyle = "#ffff33";
+            ctx.font = "14px 'Courier New', sans-serif";
+            ctx.fillText(`BOMB: ${bombIcons || "❌"}`, 15, 100);
+
+            ctx.fillStyle = "#fff";
+            ctx.font = "12px 'Courier New', sans-serif";
+            ctx.fillText(`SCORE: ${score}`, 15, 125);
+
+            requestAnimationFrame(gameLoop);
+        }
+    </script>
+</body>
+</html>
